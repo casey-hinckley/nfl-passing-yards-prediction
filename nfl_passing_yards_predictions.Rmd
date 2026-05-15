@@ -1,0 +1,663 @@
+---
+title: "nfl-passing-yards-prediction"
+author: "Casey Hinckley"
+date: "2026-05-15"
+output: html_document
+---
+
+```{r}
+# ============================================================
+# NFL PASS YARDS — 6 weeks in → 5 weeks out (7..11)
+# Rolling backtest with decay and global alpha
+# Models compared: Baseline, Ridge_Game, Ridge_Game_Tx, Poly_EN
+# Final selection = single best MAE model on backtest (no blending)
+# Uses NET passing yards (gross − sack yards lost)
+# ============================================================
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tidyr)
+  library(purrr)
+  library(janitor)
+  library(stringr)
+  library(nflreadr)
+  library(glmnet)
+  library(readr)
+  library(tidyselect)
+})
+
+# ---- config ----
+years        <- 2018:2025
+k_window     <- 6               # last 6 weeks for features
+horizon      <- 5               # predict next 5 weeks
+max_week_cap <- 18              # regular season cap
+decay_w      <- 0.6             # exponential decay inside window
+prior_n0     <- 6               # strength of prior blend
+alpha_set    <- c(0, 0.25, 0.5, 0.75, 1)   # ridge..lasso
+
+set.seed(1)
+
+# ---------------------------
+# 1) Load and aggregate to game level home and away
+# ---------------------------
+pbp <- nflreadr::load_pbp(years)
+sched <- nflreadr::load_schedules(years) %>%
+  dplyr::filter(game_type == "REG") %>%
+  dplyr::select(game_id, season, week, home_team, away_team)
+
+pbp <- pbp %>% dplyr::filter(!is.na(posteam))
+
+num_cols <- pbp %>% dplyr::select(where(is.numeric)) %>% names()
+exclude_numeric <- c(
+  "play_id","game_half","qtr","down","yardline_100","ydstogo",
+  "game_seconds_remaining","half_seconds_remaining","quarter_seconds_remaining",
+  "series","order_sequence","season","week",
+  "home_score","away_score","posteam_score","defteam_score",
+  "total_home_score","total_away_score",
+  "home_wp","away_wp","wp","def_wp","vegas_wp","wpa","vegas_wpa",
+  "home_wp_post","away_wp_post","qtr_end"
+)
+sum_vars <- setdiff(num_cols, exclude_numeric)
+
+pbp_summed <- pbp %>%
+  dplyr::group_by(game_id, posteam) %>%
+  dplyr::summarise(
+    plays = dplyr::n(),
+    dplyr::across(dplyr::all_of(sum_vars), ~ sum(.x, na.rm = TRUE), .names = "sum_{.col}"),
+    sum_sack_yards_lost = -sum(dplyr::if_else(sack == 1 & is.finite(yards_gained), yards_gained, 0), na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  janitor::clean_names()
+
+roles <- sched %>%
+  tidyr::pivot_longer(c(home_team, away_team), names_to = "role", values_to = "team") %>%
+  dplyr::mutate(role = if_else(role == "home_team", "home", "away")) %>%
+  dplyr::select(game_id, team, role)
+
+pbp_roles <- pbp_summed %>%
+  dplyr::left_join(roles, by = c("game_id","posteam" = "team")) %>%
+  dplyr::filter(!is.na(role))
+
+value_cols <- setdiff(names(pbp_roles), c("game_id","posteam","role"))
+game_wide <- pbp_roles %>%
+  dplyr::select(game_id, role, dplyr::all_of(value_cols)) %>%
+  tidyr::pivot_wider(
+    names_from  = role,
+    values_from = dplyr::all_of(value_cols),
+    names_sep   = "_"
+  ) %>%
+  janitor::clean_names()
+
+game_wide <- sched %>% dplyr::left_join(game_wide, by = "game_id") %>%
+  dplyr::relocate(season, week, home_team, away_team, .after = game_id) %>%
+  dplyr::select(-dplyr::matches("\\.(x|y)$"))
+
+# Net passing yards per side
+if (all(c("sum_passing_yards_home","sum_passing_yards_away",
+          "sum_sack_yards_lost_home","sum_sack_yards_lost_away") %in% names(game_wide))) {
+  game_wide <- game_wide %>%
+    dplyr::mutate(
+      sum_passing_yards_net_home = sum_passing_yards_home - sum_sack_yards_lost_home,
+      sum_passing_yards_net_away = sum_passing_yards_away - sum_sack_yards_lost_away
+    )
+}
+
+# totals for numeric pairs
+is_num <- vapply(game_wide, is.numeric, logical(1))
+home_cols  <- grep("_home$", names(game_wide), value = TRUE)
+base_names <- sub("_home$", "", home_cols)
+away_cols  <- paste0(base_names, "_away")
+keep_pairs <- away_cols %in% names(game_wide) & is_num[home_cols] & is_num[away_cols]
+home_cols  <- home_cols[keep_pairs]
+away_cols  <- away_cols[keep_pairs]
+base_names <- base_names[keep_pairs]
+
+for (i in seq_along(base_names)) {
+  tot_name <- paste0("total_", base_names[i])
+  game_wide[[tot_name]] <-
+    dplyr::coalesce(game_wide[[home_cols[i]]], 0) +
+    dplyr::coalesce(game_wide[[away_cols[i]]], 0)
+}
+
+# drop non-predictive families
+drop_prefixes <- c(
+  "sum_season_", "sum_week_", "sum_home_timeouts_remaining_",
+  "sum_away_timeouts_remaining_", "sum_posteam_score_", "sum_defteam_score_",
+  "sum_total_home_score_", "sum_total_away_score_", "sum_home_wp_",
+  "sum_away_wp_", "sum_wp_", "sum_def_wp_", "sum_wpa_", "sum_vegas_wp_", "sum_vegas_wpa_"
+)
+
+game_wide <- game_wide %>%
+  dplyr::select(-tidyselect::matches(paste0("^(", paste0(drop_prefixes, collapse = "|"), ")"))) %>%
+  dplyr::mutate(
+    season = as.integer(season),
+    week   = as.integer(week),
+    game_id = as.character(game_id),
+    home_team = as.character(home_team),
+    away_team = as.character(away_team)
+  )
+
+# ---------------------------
+# 2) Build team game long plus defense allowed plus priors
+# ---------------------------
+drivers <- c(
+  "plays",
+  "sum_pass_attempt", "sum_passing_yards", "sum_passing_yards_net",
+  "sum_sack",
+  "sum_rush_attempt",
+  "sum_complete_pass", "sum_incomplete_pass",
+  "sum_interception", "sum_pass_touchdown", "sum_rush_touchdown"
+)
+
+home_cols2 <- intersect(paste0(drivers, "_home"), names(game_wide))
+away_cols2 <- intersect(paste0(drivers, "_away"), names(game_wide))
+base_cols  <- c(home_cols2, away_cols2)
+
+team_games <- game_wide %>%
+  dplyr::select(game_id, season, week, home_team, away_team, dplyr::all_of(base_cols)) %>%
+  tidyr::pivot_longer(-c(game_id, season, week, home_team, away_team),
+                      names_to = "metric", values_to = "val") %>%
+  dplyr::mutate(
+    side = if_else(grepl("_home$", metric), "home", "away"),
+    base = sub("_(home|away)$", "", metric),
+    team = if_else(side == "home", home_team, away_team)
+  ) %>%
+  dplyr::select(game_id, season, week, team, base, val) %>%
+  dplyr::filter(base %in% drivers) %>%
+  janitor::clean_names() %>%
+  dplyr::mutate(
+    season = as.integer(season),
+    week   = as.integer(week),
+    game_id = as.character(game_id),
+    team    = as.character(team),
+    base    = as.character(base)
+  )
+
+opp_map <- dplyr::bind_rows(
+  game_wide %>% dplyr::transmute(game_id, season, week, team = home_team, opp_team = away_team),
+  game_wide %>% dplyr::transmute(game_id, season, week, team = away_team, opp_team = home_team)
+) %>%
+  dplyr::mutate(season = as.integer(season), week = as.integer(week), team = as.character(team), opp_team = as.character(opp_team))
+
+opp_offense <- team_games %>% dplyr::select(game_id, season, week, team, base, val) %>% dplyr::rename(opp_val = val)
+
+team_games_allowed <- team_games %>%
+  dplyr::rename(off_team = team, off_base = base, off_val = val) %>%
+  dplyr::inner_join(opp_map, by = c("game_id","season","week","off_team" = "team")) %>%
+  dplyr::inner_join(opp_offense, by = c("game_id","season","week","opp_team" = "team","off_base" = "base")) %>%
+  dplyr::transmute(
+    game_id, season = as.integer(season), week = as.integer(week),
+    team = off_team, base = paste0("allow_", off_base), val = opp_val
+  ) %>% janitor::clean_names()
+
+team_games_combined <- dplyr::bind_rows(team_games, team_games_allowed) %>%
+  dplyr::mutate(season = as.integer(season), week = as.integer(week), base = as.character(base), team = as.character(team))
+
+seasons_all   <- sort(unique(game_wide$season))
+target_season <- max(seasons_all)
+train_seasons <- seasons_all[seasons_all < target_season]
+val_season    <- max(train_seasons)
+
+priors_tbl <- team_games_combined %>%
+  dplyr::filter(season %in% train_seasons) %>%
+  dplyr::group_by(base) %>%
+  dplyr::summarise(prior = mean(val, na.rm = TRUE), .groups = "drop")
+
+blend_prior <- function(mean_to_date, prior, n, n0 = prior_n0){
+  w <- n0 / (n0 + pmax(n, 1))
+  w*prior + (1 - w)*mean_to_date
+}
+
+# ---------------------------
+# 3) Window features with exponential decay, frozen at t
+# ---------------------------
+make_window_feats <- function(team_tbl, season_, t, k, n0 = prior_n0, decay = decay_w){
+  w_start <- max(1, t - k + 1)
+  tmp <- team_tbl %>%
+    dplyr::filter(season == season_, week >= w_start, week <= t) %>%
+    dplyr::mutate(w = decay^(t - week)) %>%
+    dplyr::group_by(team, base) %>%
+    dplyr::summarise(
+      n_games = dplyr::n_distinct(week),
+      per_game = sum(val * w, na.rm = TRUE) / sum(w, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    dplyr::left_join(priors_tbl, by = "base") %>%
+    dplyr::mutate(
+      prior = dplyr::if_else(is.na(prior), mean(per_game, na.rm = TRUE), prior),
+      feat  = blend_prior(per_game, prior, n_games, n0)
+    ) %>%
+    dplyr::select(team, base, feat) %>%
+    tidyr::pivot_wider(names_from = base, values_from = feat, names_prefix = "s2d_") %>%
+    janitor::clean_names()
+  tmp
+}
+
+add_pass_target <- function(df){
+  if ("total_sum_passing_yards_net" %in% names(df)) {
+    df %>% dplyr::mutate(PASS_player = total_sum_passing_yards_net) %>%
+      dplyr::select(-dplyr::any_of(c(
+        "total_sum_passing_yards", "sum_passing_yards_home", "sum_passing_yards_away"
+      )))
+  } else if (all(c("sum_passing_yards_net_home","sum_passing_yards_net_away") %in% names(df))) {
+    df %>% dplyr::mutate(PASS_player = sum_passing_yards_net_home + sum_passing_yards_net_away) %>%
+      dplyr::select(-dplyr::any_of(c(
+        "sum_passing_yards_home","sum_passing_yards_away"
+      )))
+  } else if ("total_sum_passing_yards" %in% names(df)) {
+    df %>% dplyr::mutate(PASS_player = total_sum_passing_yards) %>%
+      dplyr::select(-dplyr::any_of(c("total_sum_passing_yards","sum_passing_yards_home","sum_passing_yards_away")))
+  } else {
+    df %>% dplyr::mutate(PASS_player = sum_passing_yards_home + sum_passing_yards_away) %>%
+      dplyr::select(-dplyr::any_of(c("sum_passing_yards_home","sum_passing_yards_away")))
+  }
+}
+
+build_design_for_weeks <- function(season_, test_weeks, k, t_anchor){
+  if (length(test_weeks) == 0) return(tibble::tibble())
+  s2d_team <- make_window_feats(team_games_combined, season_, t_anchor, k)
+
+  future_games <- game_wide %>%
+    dplyr::filter(season == season_, week %in% test_weeks) %>%
+    dplyr::select(
+      game_id, season, week, home_team, away_team,
+      dplyr::any_of(c(
+        "total_sum_passing_yards_net", "sum_passing_yards_net_home", "sum_passing_yards_net_away",
+        "total_sum_passing_yards", "sum_passing_yards_home", "sum_passing_yards_away"
+      ))
+    )
+  if (nrow(future_games) == 0) return(tibble::tibble())
+  future_games <- add_pass_target(future_games)
+
+  feats <- future_games %>%
+    dplyr::left_join(s2d_team %>% dplyr::rename_with(~ paste0("home_", .x), .cols = -team), by = c("home_team" = "team")) %>%
+    dplyr::left_join(s2d_team %>% dplyr::rename_with(~ paste0("away_", .x), .cols = -team), by = c("away_team" = "team")) %>%
+    dplyr::mutate(
+      home_att = home_s2d_sum_pass_attempt,
+      away_att = away_s2d_sum_pass_attempt,
+      home_ypa = ifelse(home_s2d_sum_pass_attempt > 0,
+                        home_s2d_sum_passing_yards_net / home_s2d_sum_pass_attempt, NA_real_),
+      away_ypa = ifelse(away_s2d_sum_pass_attempt > 0,
+                        away_s2d_sum_passing_yards_net / away_s2d_sum_pass_attempt, NA_real_),
+      home_allow_ypa = ifelse(home_s2d_allow_sum_pass_attempt > 0,
+                        home_s2d_allow_sum_passing_yards_net / home_s2d_allow_sum_pass_attempt, NA_real_),
+      away_allow_ypa = ifelse(away_s2d_allow_sum_pass_attempt > 0,
+                        away_s2d_allow_sum_passing_yards_net / away_s2d_allow_sum_pass_attempt, NA_real_),
+      # Baseline uses net YPA × attempts
+      yhat_base = home_att*home_ypa + away_att*away_ypa
+    )
+  feats
+}
+
+build_block <- function(season_, t, k){
+  test_weeks <- (t+1):(t+horizon)
+  weeks_s <- sort(unique(game_wide$week[game_wide$season == season_]))
+  test_weeks <- intersect(test_weeks, weeks_s)
+  if (length(test_weeks) == 0) return(tibble::tibble())
+  build_design_for_weeks(season_, test_weeks, k, t_anchor = t) %>% dplyr::mutate(anchor_week = t)
+}
+
+ensure_cols <- function(df, cols){
+  miss <- setdiff(cols, names(df)); if (length(miss)) for (m in miss) df[[m]] <- NA_real_; df
+}
+
+na_impute_matrix <- function(M, ref = NULL) {
+  if (is.null(ref)) ref <- M
+  cm <- suppressWarnings(colMeans(ref, na.rm = TRUE)); cm[!is.finite(cm)] <- 0
+  if (!is.matrix(M)) M <- as.matrix(M)
+  for (j in seq_len(ncol(M))) {
+    miss <- is.na(M[, j]) | !is.finite(M[, j]); if (any(miss)) M[miss, j] <- cm[j]
+  }
+  M
+}
+
+safe_nfolds <- function(n) max(3, min(5, n))
+MAE <- function(y, yhat) mean(abs(y - yhat), na.rm = TRUE)
+
+# ---------------------------
+# 4) Base and transformed features
+# ---------------------------
+.build_feats_base <- function(df) {
+  req <- c("home_att","away_att","home_ypa","away_ypa","home_allow_ypa","away_allow_ypa")
+  for (r in req) if (!r %in% names(df)) df[[r]] <- NA_real_
+  df %>%
+    dplyr::mutate(
+      home_ypa_gap = home_ypa - away_allow_ypa,
+      away_ypa_gap = away_ypa - home_allow_ypa,
+      home_yards_proxy = home_att * home_ypa,
+      away_yards_proxy = away_att * away_ypa,
+      total_proxy = home_yards_proxy + away_yards_proxy,
+      diff_att = home_att - away_att
+    ) %>%
+    dplyr::select(
+      home_att, away_att, home_ypa, away_ypa,
+      home_allow_ypa, away_allow_ypa,
+      home_ypa_gap, away_ypa_gap,
+      home_yards_proxy, away_yards_proxy,
+      total_proxy, diff_att
+    )
+}
+
+.fit_caps <- function(X, p_lo = 0.01, p_hi = 0.99) {
+  lo <- apply(X, 2, function(v) suppressWarnings(quantile(v[is.finite(v)], p_lo, na.rm = TRUE)))
+  hi <- apply(X, 2, function(v) suppressWarnings(quantile(v[is.finite(v)], p_hi, na.rm = TRUE)))
+  list(lo = lo, hi = hi)
+}
+.apply_caps <- function(X, caps) {
+  for (j in seq_len(ncol(X))) X[, j] <- pmax(caps$lo[j], pmin(caps$hi[j], X[, j]))
+  X
+}
+
+.build_feats_transformed <- function(df_tr, df_te) {
+  Xtr0 <- .build_feats_base(df_tr); Xte0 <- .build_feats_base(df_te)
+  caps <- .fit_caps(as.matrix(Xtr0))
+  Xtr0 <- as.data.frame(.apply_caps(as.matrix(Xtr0), caps))
+  Xte0 <- as.data.frame(.apply_caps(as.matrix(Xte0), caps))
+  add_tx <- function(D) {
+    D %>% dplyr::mutate(
+      log1p_home_att = log1p(home_att),
+      log1p_away_att = log1p(away_att),
+      sqrt_home_att  = sqrt(pmax(home_att, 0)),
+      sqrt_away_att  = sqrt(pmax(away_att, 0)),
+      log1p_home_ypa = log1p(pmax(home_ypa, 0)),
+      log1p_away_ypa = log1p(pmax(away_ypa, 0)),
+      log1p_home_allow_ypa = log1p(pmax(home_allow_ypa, 0)),
+      log1p_away_allow_ypa = log1p(pmax(away_allow_ypa, 0))
+    )
+  }
+  Xtr1 <- add_tx(Xtr0); Xte1 <- add_tx(Xte0)
+  form <- ~ . +
+    home_att:home_ypa + away_att:away_ypa +
+    home_att:away_allow_ypa + away_att:home_allow_ypa +
+    home_ypa_gap:home_att + away_ypa_gap:away_att
+  Xtr <- model.matrix(form, data = Xtr1)[, -1, drop = FALSE]
+  Xte <- model.matrix(form, data = Xte1)[, -1, drop = FALSE]
+  list(Xtr = Xtr, Xte = Xte)
+}
+
+# ---------------------------
+# 5) Predictors
+# ---------------------------
+ridge_game_predict <- function(train_rows, test_rows, alpha = 0){
+  req <- c("home_att","away_att","home_ypa","away_ypa","home_allow_ypa","away_allow_ypa")
+  train_rows <- ensure_cols(train_rows, req); test_rows <- ensure_cols(test_rows, req)
+  trB <- .build_feats_base(train_rows); teB <- .build_feats_base(test_rows)
+  keep <- !is.na(train_rows$PASS_player)
+  if (!any(keep)) return(as.numeric(test_rows$yhat_base))
+  Xtr_raw <- as.matrix(trB[keep, , drop = FALSE]); ytr <- train_rows$PASS_player[keep]
+  Xte_raw <- as.matrix(teB[, , drop = FALSE])
+  Xtr <- na_impute_matrix(Xtr_raw); Xte <- na_impute_matrix(Xte_raw, ref = Xtr)
+  if (length(ytr) < 20) return(as.numeric(test_rows$yhat_base))
+  cv  <- glmnet::cv.glmnet(Xtr, ytr, alpha = alpha, family = "gaussian",
+                           nfolds = safe_nfolds(nrow(Xtr)), standardize = TRUE, type.measure = "mae")
+  fit <- glmnet::glmnet(Xtr, ytr, alpha = alpha, lambda = cv$lambda.min, family = "gaussian", standardize = TRUE)
+  as.numeric(predict(fit, Xte))
+}
+
+ridge_game_predict_tx <- function(train_rows, test_rows, alpha = 0.75){
+  keep <- !is.na(train_rows$PASS_player)
+  if (!any(keep)) return(as.numeric(test_rows$yhat_base))
+  mats <- .build_feats_transformed(train_rows[keep, ], test_rows)
+  Xtr <- na_impute_matrix(mats$Xtr); Xte <- na_impute_matrix(mats$Xte, ref = Xtr)
+  ytr <- train_rows$PASS_player[keep]
+  if (length(ytr) < 50) return(as.numeric(test_rows$yhat_base))
+  cv  <- glmnet::cv.glmnet(Xtr, ytr, alpha = alpha, family = "gaussian",
+                           nfolds = safe_nfolds(nrow(Xtr)), standardize = TRUE, type.measure = "mae")
+  fit <- glmnet::glmnet(Xtr, ytr, alpha = alpha, lambda = cv$lambda.min, family = "gaussian", standardize = TRUE)
+  as.numeric(predict(fit, Xte))
+}
+
+poly_en_predict <- function(train_rows, test_rows, alpha_grid = alpha_set) {
+  feats_tr <- .build_feats_base(train_rows) %>%
+    dplyr::select(home_att, away_att, home_ypa, away_ypa,
+                  home_allow_ypa, away_allow_ypa,
+                  home_ypa_gap, away_ypa_gap,
+                  home_yards_proxy, away_yards_proxy)
+  feats_te <- .build_feats_base(test_rows) %>%
+    dplyr::select(home_att, away_att, home_ypa, away_ypa,
+                  home_allow_ypa, away_allow_ypa,
+                  home_ypa_gap, away_ypa_gap,
+                  home_yards_proxy, away_yards_proxy)
+  ytr <- train_rows$PASS_player
+  keep_y <- is.finite(ytr)
+  if (sum(keep_y) < 40) return(as.numeric(test_rows$yhat_base))
+
+  poly_form <- stats::as.formula("~ (.)^2 + I(home_ypa^2) + I(away_ypa^2) + I(home_att^2) + I(away_att^2)")
+  Xtr_raw <- stats::model.matrix(poly_form, data = feats_tr, na.action = stats::na.pass)[, -1, drop = FALSE]
+  Xte_raw <- stats::model.matrix(poly_form, data = feats_te, na.action = stats::na.pass)[, -1, drop = FALSE]
+  Xtr_raw <- Xtr_raw[keep_y, , drop = FALSE]; ytr <- ytr[keep_y]
+  Xtr <- na_impute_matrix(Xtr_raw); Xte <- na_impute_matrix(Xte_raw, ref = Xtr)
+
+  best <- list(mae = Inf, alpha = NA, cv = NULL)
+  for (a in alpha_grid) {
+    cv <- glmnet::cv.glmnet(Xtr, ytr, alpha = a, family = "gaussian",
+                            nfolds = safe_nfolds(nrow(Xtr)), type.measure = "mae",
+                            standardize = TRUE)
+    if (cv$cvm[cv$lambda == cv$lambda.min] < best$mae) {
+      best <- list(mae = cv$cvm[cv$lambda == cv$lambda.min], alpha = a, cv = cv)
+    }
+  }
+  as.numeric(predict(best$cv, Xte, s = best$cv$lambda.min))
+}
+
+# ---------------------------
+# 6) Build rolling blocks
+# ---------------------------
+build_backtest_blocks <- function(seasons, k){
+  rows <- list()
+  for (s in seasons) {
+    weeks_s <- sort(unique(game_wide$week[game_wide$season == s]))
+    if (length(weeks_s) == 0L) next
+    max_week_s <- max(weeks_s, na.rm = TRUE)
+    max_anchor <- min(max_week_cap - horizon, max_week_s - horizon)
+    if (!is.finite(max_anchor) || max_anchor < k) next
+    for (t in seq.int(k, max_anchor)) {
+      blk <- build_block(s, t, k)
+      if (!is.null(blk) && nrow(blk) > 0) rows[[length(rows) + 1L]] <- blk
+    }
+  }
+  if (length(rows) == 0L) tibble::tibble() else dplyr::bind_rows(rows)
+}
+
+seasons_all   <- sort(unique(game_wide$season))
+target_season <- max(seasons_all)
+train_seasons <- seasons_all[seasons_all < target_season]
+val_season    <- max(train_seasons)
+
+bt_all <- build_backtest_blocks(train_seasons, k_window)
+cat(sprintf("Backtest windows built: %d blocks\n", dplyr::n_distinct(bt_all$season*100 + bt_all$anchor_week)))
+
+key_feats <- c("home_att","away_att","home_ypa","away_ypa","home_allow_ypa","away_allow_ypa")
+bt_all <- bt_all %>% dplyr::filter(dplyr::if_any(dplyr::all_of(key_feats), ~ !is.na(.x)))
+stopifnot(nrow(bt_all) > 0)
+
+# ---------------------------
+# 7) Global alpha selection for ridge models
+# ---------------------------
+score_for_alpha <- function(alpha, mode = c("game","tx")){
+  mode <- match.arg(mode)
+  res <- bt_all %>% tidyr::drop_na(season, anchor_week) %>% dplyr::group_by(season, anchor_week) %>%
+    dplyr::group_map(~{
+      s <- .y$season[[1]]; a <- .y$anchor_week[[1]]
+      test_rows  <- .x
+      train_rows <- bt_all %>% dplyr::filter(!(season == s & anchor_week == a))
+      yhat_model <- switch(mode,
+        game = ridge_game_predict(train_rows, test_rows, alpha),
+        tx   = ridge_game_predict_tx(train_rows, test_rows, alpha)
+      )
+      tibble::tibble(
+        mae_base  = MAE(test_rows$PASS_player, test_rows$yhat_base),
+        mae_model = MAE(test_rows$PASS_player, yhat_model)
+      )
+    }) %>% dplyr::bind_rows()
+  c(base = mean(res$mae_base, na.rm = TRUE), model = mean(res$mae_model, na.rm = TRUE))
+}
+
+alphas_game <- purrr::map(alpha_set, ~ score_for_alpha(.x, "game"))
+alphas_tx   <- purrr::map(alpha_set, ~ score_for_alpha(.x, "tx"))
+
+alpha_tbl_game <- tibble::tibble(alpha = alpha_set, base_MAE = purrr::map_dbl(alphas_game, 1), model_MAE = purrr::map_dbl(alphas_game, 2))
+alpha_tbl_tx   <- tibble::tibble(alpha = alpha_set, base_MAE = purrr::map_dbl(alphas_tx,   1), model_MAE = purrr::map_dbl(alphas_tx,   2))
+
+best_alpha_game <- alpha_tbl_game$alpha[which.min(alpha_tbl_game$model_MAE)]
+best_alpha_tx   <- alpha_tbl_tx$alpha[which.min(alpha_tbl_tx$model_MAE)]
+
+cat(sprintf("Global alpha chosen — ridge_game: %.2f | ridge_game_tx: %.2f\n",
+            best_alpha_game, best_alpha_tx))
+
+# ---------------------------
+# 8) Backtest comparison across models
+# ---------------------------
+bt_compare <- bt_all %>%
+  tidyr::drop_na(season, anchor_week) %>%
+  dplyr::group_by(season, anchor_week) %>%
+  dplyr::group_map(~{
+    test_rows  <- .x
+    train_rows <- bt_all %>% dplyr::filter(!(season == .y$season[[1]] & anchor_week == .y$anchor_week[[1]]))
+
+    base <- test_rows$yhat_base
+    y    <- test_rows$PASS_player
+
+    yh_rg    <- ridge_game_predict(train_rows, test_rows, best_alpha_game)
+    yh_tx    <- ridge_game_predict_tx(train_rows, test_rows, best_alpha_tx)
+    yh_poly  <- poly_en_predict(train_rows, test_rows)
+
+    tibble::tibble(
+      mae_baseline = MAE(y, base),
+      mae_ridge_game = MAE(y, yh_rg),
+      mae_ridge_game_tx = MAE(y, yh_tx),
+      mae_poly_en = MAE(y, yh_poly)
+    )
+  }) %>%
+  dplyr::bind_rows()
+
+comp_table <- tibble::tibble(
+  Model = c("Baseline", "Ridge_Game", "Ridge_Game_Tx", "Poly_EN")
+) %>%
+  dplyr::mutate(
+    MAE = c(mean(bt_compare$mae_baseline, na.rm = TRUE),
+            mean(bt_compare$mae_ridge_game, na.rm = TRUE),
+            mean(bt_compare$mae_ridge_game_tx, na.rm = TRUE),
+            mean(bt_compare$mae_poly_en, na.rm = TRUE))
+  ) %>%
+  dplyr::arrange(MAE)
+
+cat("\n=== Backtest MAE comparison (lower is better) ===\n")
+print(comp_table, n = Inf)
+
+# choose single best model by MAE
+best_model <- comp_table$Model[[1]]
+cat(sprintf("\nSelected final model: %s\n\n", best_model))
+
+# ---------------------------
+# 9) Final predictions for current season weeks 7..11 using anchor 6
+# ---------------------------
+t_anchor <- 6
+pred_weeks <- (t_anchor+1):(t_anchor+horizon)
+
+cur_design <- build_design_for_weeks(target_season, pred_weeks, k_window, t_anchor) %>%
+  dplyr::left_join(
+    game_wide %>% dplyr::filter(season == target_season, week %in% pred_weeks) %>%
+      dplyr::select(game_id,
+                    sum_passing_yards_net_home, sum_passing_yards_net_away),
+    by = "game_id"
+  )
+
+train_rows_final <- bt_all
+
+# compute predictions for each model family
+pred_baseline      <- cur_design$yhat_base
+pred_ridge_game    <- ridge_game_predict(train_rows_final, cur_design, best_alpha_game)
+pred_ridge_game_tx <- ridge_game_predict_tx(train_rows_final, cur_design, best_alpha_tx)
+pred_poly_en       <- poly_en_predict(train_rows_final, cur_design)
+
+# set final pred equal to whichever model won in backtest
+cur_design$pred <- dplyr::case_when(
+  best_model == "Baseline"       ~ as.numeric(pred_baseline),
+  best_model == "Ridge_Game"     ~ as.numeric(pred_ridge_game),
+  best_model == "Ridge_Game_Tx"  ~ as.numeric(pred_ridge_game_tx),
+  best_model == "Poly_EN"        ~ as.numeric(pred_poly_en),
+  TRUE ~ as.numeric(pred_baseline)
+)
+
+# all models side by side for output
+out_all <- cur_design %>%
+  dplyr::select(season, week, game_id, home_team, away_team) %>%
+  dplyr::mutate(
+    pred_baseline      = as.numeric(pred_baseline),
+    pred_ridge_game    = as.numeric(pred_ridge_game),
+    pred_ridge_game_tx = as.numeric(pred_ridge_game_tx),
+    pred_poly_en       = as.numeric(pred_poly_en),
+    final_method       = best_model,
+    final_pred         = as.numeric(cur_design$pred)
+  ) %>%
+  dplyr::arrange(week, home_team)
+
+# write main final file
+out <- cur_design %>%
+  dplyr::select(season, week, game_id, home_team, away_team,
+                pred_pass_yards = pred, baseline_frozen = yhat_base) %>%
+  dplyr::arrange(week, home_team)
+
+file_main <- paste0("pred_weeks_", min(pred_weeks), "_", max(pred_weeks),
+                    "_season_", target_season, ".csv")
+readr::write_csv(out, file_main)
+
+# write each reference file
+readr::write_csv(
+  cur_design %>%
+    dplyr::mutate(pred = yhat_base) %>%
+    dplyr::select(season, week, game_id, home_team, away_team,
+                  pred_pass_yards = pred, baseline_frozen = yhat_base) %>%
+    dplyr::arrange(week, home_team),
+  paste0("pred_weeks_", min(pred_weeks), "_", max(pred_weeks),
+         "_season_", target_season, "_BASELINE.csv")
+)
+
+readr::write_csv(
+  cur_design %>%
+    dplyr::mutate(pred = pred_ridge_game) %>%
+    dplyr::select(season, week, game_id, home_team, away_team,
+                  pred_pass_yards = pred, baseline_frozen = yhat_base) %>%
+    dplyr::arrange(week, home_team),
+  paste0("pred_weeks_", min(pred_weeks), "_", max(pred_weeks),
+         "_season_", target_season, "_RIDGE_GAME.csv")
+)
+
+readr::write_csv(
+  cur_design %>%
+    dplyr::mutate(pred = pred_ridge_game_tx) %>%
+    dplyr::select(season, week, game_id, home_team, away_team,
+                  pred_pass_yards = pred, baseline_frozen = yhat_base) %>%
+    dplyr::arrange(week, home_team),
+  paste0("pred_weeks_", min(pred_weeks), "_", max(pred_weeks),
+         "_season_", target_season, "_RIDGE_GAME_TX.csv")
+)
+
+readr::write_csv(
+  cur_design %>%
+    dplyr::mutate(pred = pred_poly_en) %>%
+    dplyr::select(season, week, game_id, home_team, away_team,
+                  pred_pass_yards = pred, baseline_frozen = yhat_base) %>%
+    dplyr::arrange(week, home_team),
+  paste0("pred_weeks_", min(pred_weeks), "_", max(pred_weeks),
+         "_season_", target_season, "_POLY_EN.csv")
+)
+
+# write all models side by side
+file_all <- paste0("pred_weeks_", min(pred_weeks), "_", max(pred_weeks),
+                   "_season_", target_season, "_ALL_MODELS.csv")
+readr::write_csv(out_all, file_all)
+
+cat("nflverse games and schedules\n")
+cat(sprintf("Predictions weeks %d..%d written for season %d.\n", min(pred_weeks), max(pred_weeks), target_season))
+cat(sprintf("Final selected model: %s\n", best_model))
+
+cat("\n=== Side by side predictions for all models ===\n")
+print(out_all, n = Inf)
+
+# ============================================================
+# End
+# ============================================================
+
+```
